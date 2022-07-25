@@ -8,6 +8,7 @@ main() {
     python -m pip install -U pip
     pip install -r requirements.txt
     deactivate
+    chmod +x scripts/run.sh
 }
 
 main
