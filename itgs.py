@@ -6,6 +6,8 @@ import rqdb
 import rqdb.async_connection
 import redis.asyncio
 import os
+import slack
+import jobs
 
 
 class Itgs:
@@ -25,6 +27,12 @@ class Itgs:
 
         self._redis_main: Optional[redis.asyncio.Redis] = None
         """the redis main connection, if it has been detected via the sentinel"""
+
+        self._slack: Optional[slack.Slack] = None
+        """the slack connection if it has been opened"""
+
+        self._jobs: Optional[jobs.Jobs] = None
+        """the jobs connection if it had been opened"""
 
         self._closures: List[Callable[["Itgs"], Coroutine]] = []
         """functions to run on __aexit__ to cleanup opened resources"""
@@ -85,3 +93,31 @@ class Itgs:
         )
         self._redis_main = self._sentinel.master_for("mymaster")
         return self._redis_main
+
+    async def slack(self) -> slack.Slack:
+        """gets or creates and gets the slack connection"""
+        if self._slack is not None:
+            return self._slack
+        self._slack = slack.Slack()
+        await self._slack.__aenter__()
+
+        async def cleanup(me: "Itgs") -> None:
+            await me._slack.__aexit__(None, None, None)
+            me._slack = None
+
+        self._closures.append(cleanup)
+        return self._slack
+
+    async def jobs(self) -> jobs.Jobs:
+        """gets or creates the jobs connection"""
+        if self._jobs is not None:
+            return self._jobs
+        self._jobs = jobs.Jobs(await self.redis())
+        await self._jobs.__aenter__()
+
+        async def cleanup(me: "Itgs") -> None:
+            await me._jobs.__aexit__(None, None, None)
+            me._jobs = None
+
+        self._closures.append(cleanup)
+        return self._jobs
