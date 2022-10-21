@@ -239,12 +239,19 @@ async def watch_progress_bar_trace(websocket: WebSocket):
                     progress_bar_steps.iterated_percentile
                 FROM progress_bar_steps
                 WHERE 
-                    progress_bar_steps.progress_bar_uid = ?
+                    EXISTS(
+                        SELECT 1 FROM progress_bars
+                        WHERE progress_bars.id = progress_bar_steps.progress_bar_id
+                        AND progress_bars.uid = ?
+                        AND progress_bars.version = ?
+                    )
                     AND progress_bar_steps.position != 0
                 ORDER BY progress_bar_steps.position ASC
                 """,
-                (bar_info.uid,),
+                (bar_info.uid, bar_info.version),
             )
+            if not response.results:
+                return await websocket.close(code=1013)
             steps_info = [
                 BarStepInfo(
                     uid=step[0],
@@ -257,6 +264,23 @@ async def watch_progress_bar_trace(websocket: WebSocket):
                 for step in response.results
             ]
         else:
+            user_response = await cursor.execute(
+                "SELECT 1 FROM users WHERE sub = ?", (message.sub,)
+            )
+            if not user_response.results:
+                await asyncio.wait_for(
+                    websocket.send_text(
+                        AuthorizationFailurePacket(
+                            success=False,
+                            error_category=403,
+                            error_type="account_not_found",
+                            error_message="The user account was not found",
+                        ).json()
+                    ),
+                    timeout=SEND_TIMEOUT,
+                )
+                await websocket.close(code=1008)
+                return
             bar_info = BarInfo(
                 user_sub=message.sub,
                 uid="ep_pb_" + secrets.token_urlsafe(8),
@@ -266,8 +290,12 @@ async def watch_progress_bar_trace(websocket: WebSocket):
                 default_one_off_percentile=75,
                 bootstrapped=True,
             )
+        await asyncio.wait_for(
+            websocket.send_text(AuthorizationSuccessPacket(success=True).json()),
+            timeout=SEND_TIMEOUT,
+        )
         eta_info = await get_trace_eta(itgs, bar_info, steps_info)
-        if eta_info.version != bar_info.version:
+        if not bar_info.bootstrapped and eta_info.version != bar_info.version:
             return await websocket.close(code=1013)
         redis = await itgs.redis()
         pubsub = redis.pubsub()
@@ -419,15 +447,18 @@ async def watch_progress_bar_trace(websocket: WebSocket):
             else:
                 timeout = SERVER_IDLE_TIMEOUT
 
-            timeout_remaining = timeout - (time.time() - websocket_ready_at)
-            if timeout_remaining <= 0:
-                break
-
             try:
-                await asyncio.wait_for(
-                    pubsub.get_message(ignore_subscribe_messages=True),
-                    timeout=timeout_remaining,
-                )
+                pubsub_message = None
+                while pubsub_message is None:
+                    timeout_remaining = timeout - (time.time() - websocket_ready_at)
+                    if timeout_remaining <= 0:
+                        break
+                    pubsub_message = await asyncio.wait_for(
+                        pubsub.get_message(ignore_subscribe_messages=True),
+                        timeout=timeout_remaining,
+                    )
+                if timeout_remaining <= 0:
+                    break
             except asyncio.TimeoutError:
                 break
 
@@ -470,7 +501,7 @@ async def get_info_from_redis(
             "finished_at",
         )
         step_info = TraceStepInfo(
-            step_name=step_info_raw[0],
+            step_name=str(step_info_raw[0], "utf-8"),
             iteration=int(step_info_raw[1]),
             iterations=int(step_info_raw[2]),
             started_at=float(step_info_raw[3]),
@@ -585,7 +616,7 @@ async def get_trace_eta(
             message: Optional[RedisPubSubMessage] = await pubsub.get_message(
                 ignore_subscribe_messages=True, timeout=JOB_STATS_TIMEOUT
             )
-            if message is not None or message["type"] != "message":
+            if message is not None and message["type"] == "message":
                 break
         await pubsub.unsubscribe(f"ps:job:{job_uid}")
     return BarEta.parse_raw(message["data"])
